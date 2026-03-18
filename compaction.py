@@ -7,6 +7,7 @@ import logging
 
 from baal_agent.config import AgentSettings
 from baal_agent.database import AgentDatabase
+from baal_agent.image_utils import strip_images_from_content
 from baal_agent.inference import InferenceClient
 
 logger = logging.getLogger(__name__)
@@ -30,22 +31,37 @@ def get_context_limit(model: str, configured_max: int) -> int:
     return _MODEL_CONTEXT_SIZES.get(model, _DEFAULT_CONTEXT_SIZE)
 
 
+_IMAGE_TOKEN_ESTIMATE = 1000
+
+
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate for a list of chat messages.
 
     Uses chars/2 heuristic plus per-message overhead.  Conservative ratio
     because code, JSON, tool call IDs, and structured data tokenize at
     significantly worse than chars/4 with BPE tokenizers.
+
+    Multimodal content (list of blocks) is handled by summing text block
+    lengths and adding _IMAGE_TOKEN_ESTIMATE per image block.
     """
     total_chars = 0
+    image_count = 0
     for msg in messages:
-        if msg.get("content"):
-            total_chars += len(msg["content"])
+        content = msg.get("content")
+        if content:
+            if isinstance(content, list):
+                for block in content:
+                    if block.get("type") == "text" and block.get("text"):
+                        total_chars += len(block["text"])
+                    elif block.get("type") == "image_url":
+                        image_count += 1
+            else:
+                total_chars += len(content)
         if msg.get("tool_calls"):
             total_chars += len(json.dumps(msg["tool_calls"]))
         if msg.get("tool_call_id"):
             total_chars += len(msg["tool_call_id"])
-    return total_chars // 2 + 4 * len(messages)
+    return total_chars // 2 + image_count * _IMAGE_TOKEN_ESTIMATE + 4 * len(messages)
 
 
 _COMPACTION_PROMPT = (
@@ -119,19 +135,30 @@ async def maybe_compact(
     old = history[:-keep]
     recent = history[-keep:]
 
+    # Strip images from old messages before sending to the compaction LLM.
+    stripped_old = []
+    for msg in old:
+        content = msg.get("content")
+        if isinstance(content, list):
+            stripped_msg = {**msg, "content": strip_images_from_content(content)}
+            stripped_old.append(stripped_msg)
+        else:
+            stripped_old.append(msg)
+
     # Build compaction request reusing the system prompt prefix for cache hits.
     compaction_messages = [{"role": "system", "content": system_prompt}]
-    compaction_messages.extend(old)
+    compaction_messages.extend(stripped_old)
     compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
 
     # If the compaction request itself exceeds the context budget, iteratively
     # halve the old messages until it fits (oldest are dropped).
     compaction_tokens = estimate_tokens(compaction_messages)
-    while compaction_tokens > budget and len(old) > 2:
-        dropped = len(old) // 2
+    while compaction_tokens > budget and len(stripped_old) > 2:
+        dropped = len(stripped_old) // 2
         old = old[dropped:]
+        stripped_old = stripped_old[dropped:]
         compaction_messages = [{"role": "system", "content": system_prompt}]
-        compaction_messages.extend(old)
+        compaction_messages.extend(stripped_old)
         compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
         compaction_tokens = estimate_tokens(compaction_messages)
         logger.info(f"Compaction request too large, dropped {dropped} oldest messages")
