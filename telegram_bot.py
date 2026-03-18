@@ -351,6 +351,8 @@ class TelegramBot:
         combined_caption = "\n".join(captions).strip()
         if combined_caption:
             content_blocks.insert(0, {"type": "text", "text": combined_caption})
+        elif not any(b.get("type") == "text" for b in content_blocks):
+            content_blocks.insert(0, {"type": "text", "text": "[User sent images]"})
 
         if not content_blocks:
             return
@@ -492,7 +494,7 @@ class TelegramBot:
                     caption = msg.get("caption", "") or text
                     try:
                         local_path = await self._download_file(photo["file_id"], f"{photo['file_id']}.jpg")
-                        content = build_image_content_blocks(local_path, annotation=caption or None)
+                        content = build_image_content_blocks(local_path, annotation=caption or "[User sent image]")
                     except Exception as e:
                         logger.error(f"Failed to download photo: {e}")
                         content = caption or "[Photo could not be downloaded]"
@@ -505,7 +507,7 @@ class TelegramBot:
                     try:
                         local_path = await self._download_file(doc["file_id"], file_name)
                         if is_image(local_path):
-                            content = build_image_content_blocks(local_path, annotation=caption or None)
+                            content = build_image_content_blocks(local_path, annotation=caption or f"[User sent image: {file_name}]")
                         else:
                             annotation = f"[File saved: {local_path}]"
                             if caption:

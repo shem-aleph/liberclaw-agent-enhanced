@@ -60,16 +60,10 @@ class AgentDatabase:
                 content_rowid=id
             )
         """)
-        # Drop the old auto-insert trigger (multimodal content needs manual FTS insert)
+        # Drop old triggers — multimodal content needs application-level FTS management
+        # (the trigger-based approach can't handle JSON content vs text-only FTS entries)
         await self._db.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
-        await self._db.executescript("""
-            CREATE TRIGGER IF NOT EXISTS messages_fts_delete
-            AFTER DELETE ON messages WHEN old.content IS NOT NULL AND old.content != ''
-            BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                    VALUES('delete', old.id, old.content);
-            END;
-        """)
+        await self._db.execute("DROP TRIGGER IF EXISTS messages_fts_delete")
         # Rebuild FTS index to catch any messages added before FTS was enabled
         await self._db.execute(
             "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
@@ -238,6 +232,8 @@ class AgentDatabase:
         row = await cursor.fetchone()
         count = row["cnt"] if row else 0
         await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        # Rebuild FTS index to remove stale entries from deleted messages
+        await self.db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         await self.db.commit()
         return count
 
