@@ -14,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from baal_agent.compaction import maybe_compact
 from baal_agent.config import AgentSettings
@@ -87,7 +87,7 @@ class ChatRun:
     done: bool = False
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
-    user_message: str = ""
+    user_message: str | list[dict] = ""
 
 
 _active_runs: dict[str, ChatRun] = {}  # keyed by chat_id
@@ -106,7 +106,7 @@ def _prune_old_chat_runs():
 
 # ── Telegram callback ────────────────────────────────────────────────
 
-async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
+async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str | None:
     """Callback for TelegramBot: run an agent turn and return the response text.
 
     Registers a ChatRun in _active_runs so cancel_chat_run() works for /stop.
@@ -212,7 +212,7 @@ async def verify_auth(request: Request, call_next):
 # ── Core agentic loop ─────────────────────────────────────────────────
 
 async def _run_agent_turn(
-    message: str,
+    message: str | list[dict],
     chat_id: str,
     *,
     restricted: bool = False,
@@ -241,6 +241,10 @@ async def _run_agent_turn(
     iterations = max_iterations or settings.max_tool_iterations
     tools = get_tool_definitions(include_spawn=not restricted)
     tool_names = [t["function"]["name"] for t in tools]
+    pending_images: list[dict] = []
+
+    def _stash_images(blocks: list[dict]):
+        pending_images.extend(blocks)
 
     if store_history:
         # Use static prompt + dynamic context injection for KV cache preservation.
@@ -326,7 +330,7 @@ async def _run_agent_turn(
             if name == "spawn" and not restricted:
                 result = await _handle_spawn(arguments, chat_id)
             else:
-                result = await execute_tool(name, arguments)
+                result = await execute_tool(name, arguments, image_callback=_stash_images)
 
             # Detect send_file markers and accumulate for callers
             if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -344,6 +348,11 @@ async def _run_agent_turn(
                 "tool_call_id": tc.id,
                 "content": result,
             })
+
+        # Inject any images collected from tool results as a user message
+        if pending_images:
+            messages.append({"role": "user", "content": list(pending_images)})
+            pending_images.clear()
 
     return final_text
 
@@ -555,8 +564,33 @@ def _sse_keepalive() -> str:
 # ── Endpoints ─────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str | list[dict]
     chat_id: str
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, v):
+        if isinstance(v, str):
+            if not v.strip():
+                raise ValueError("message must not be empty")
+            return v
+        # list[dict] — validate structure
+        if not v:
+            raise ValueError("message list must not be empty")
+        has_text = False
+        image_count = 0
+        for item in v:
+            if not isinstance(item, dict) or "type" not in item:
+                raise ValueError("each content block must have a 'type' field")
+            if item["type"] == "text":
+                has_text = True
+            elif item["type"] == "image_url":
+                image_count += 1
+        if not has_text:
+            raise ValueError("message must contain at least one text block")
+        if image_count > 10:
+            raise ValueError("message must not contain more than 10 images")
+        return v
 
 
 async def _emit(run: ChatRun, data: dict):
@@ -566,11 +600,15 @@ async def _emit(run: ChatRun, data: dict):
         run.condition.notify_all()
 
 
-async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
+async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[dict]):
     """Background agentic loop — emits SSE events to run.events buffer."""
     try:
         tools = get_tool_definitions(include_spawn=True)
         tool_names = [t["function"]["name"] for t in tools]
+        pending_images: list[dict] = []
+
+        def _stash_images(blocks: list[dict]):
+            pending_images.extend(blocks)
 
         # Use static prompt + dynamic context injection for KV cache preservation
         system_prompt = build_static_system_prompt(
@@ -672,7 +710,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
                 if name == "spawn":
                     coro = _handle_spawn(arguments, chat_id)
                 else:
-                    coro = execute_tool(name, arguments)
+                    coro = execute_tool(name, arguments, image_callback=_stash_images)
 
                 try:
                     result = await coro
@@ -698,6 +736,11 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
                     "tool_call_id": tc.id,
                     "content": result,
                 })
+
+            # Inject any images collected from tool results as a user message
+            if pending_images:
+                messages.append({"role": "user", "content": list(pending_images)})
+                pending_images.clear()
 
         await _emit(run, {"type": "text", "content": "(Reached maximum tool iterations)"})
 
@@ -936,7 +979,7 @@ async def upload_file(
 async def health():
     from baal_agent import AGENT_VERSION
 
-    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION}
+    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": ["vision"]}
 
 
 # ── Subagent management endpoints ─────────────────────────────────────
