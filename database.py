@@ -60,13 +60,9 @@ class AgentDatabase:
                 content_rowid=id
             )
         """)
+        # Drop the old auto-insert trigger (multimodal content needs manual FTS insert)
+        await self._db.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
         await self._db.executescript("""
-            CREATE TRIGGER IF NOT EXISTS messages_fts_insert
-            AFTER INSERT ON messages WHEN new.content IS NOT NULL AND new.content != ''
-            BEGIN
-                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-
             CREATE TRIGGER IF NOT EXISTS messages_fts_delete
             AFTER DELETE ON messages WHEN old.content IS NOT NULL AND old.content != ''
             BEGIN
@@ -104,18 +100,29 @@ class AgentDatabase:
         self,
         chat_id: str,
         role: str,
-        content: str | None,
+        content: str | list[dict] | None,
         *,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
     ) -> None:
+        from baal_agent.image_utils import extract_text_from_content
+
         now = datetime.now(timezone.utc).isoformat()
         tc_json = json.dumps(tool_calls) if tool_calls else None
-        await self.db.execute(
+        # Serialize list content to JSON for storage
+        stored = json.dumps(content) if isinstance(content, list) else content
+        cursor = await self.db.execute(
             "INSERT INTO messages (chat_id, role, content, tool_calls, tool_call_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, role, content, tc_json, tool_call_id, now),
+            (chat_id, role, stored, tc_json, tool_call_id, now),
         )
+        # Manually insert text-only version into FTS index
+        text = extract_text_from_content(content)
+        if text:
+            await self.db.execute(
+                "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
+                (cursor.lastrowid, text),
+            )
         await self.db.commit()
 
     async def get_history(self, chat_id: str, limit: int = 50) -> list[dict]:
@@ -130,7 +137,15 @@ class AgentDatabase:
         for r in reversed(rows):
             msg: dict = {"role": r["role"]}
             if r["content"] is not None:
-                msg["content"] = r["content"]
+                content = r["content"]
+                # Deserialize multimodal content stored as JSON list
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        content = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                msg["content"] = content
             if r["tool_calls"]:
                 msg["tool_calls"] = json.loads(r["tool_calls"])
             if r["tool_call_id"]:
