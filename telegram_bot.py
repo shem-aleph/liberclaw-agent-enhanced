@@ -455,6 +455,15 @@ class TelegramBot:
             if status == "allowed":
                 tg_chat_id = f"tg:{chat_id}"
 
+                # Handle /clear command — wipe conversation history
+                if text and text.strip().lower() in ("/clear", "/clear@" + self._bot_username.lower()):
+                    count = await self.db.clear_history(tg_chat_id)
+                    await self._send_message(
+                        chat_id,
+                        f"Conversation cleared ({count} messages removed). Starting fresh.",
+                    )
+                    return
+
                 # Handle /stop command — cancel active run and clear queue
                 if text and text.strip().lower() in ("/stop", "/stop@" + self._bot_username.lower()):
                     cancelled = False
