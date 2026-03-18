@@ -10,13 +10,21 @@ import os
 import re
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
+from baal_agent.image_utils import (
+    build_image_content_blocks,
+    encode_bytes_to_data_uri,
+    is_image,
+)
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
 
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
+
+_IMAGE_AWARE_TOOLS = {"read_file", "web_fetch"}
 
 # ── Workspace configuration ──────────────────────────────────────────
 
@@ -395,7 +403,7 @@ async def _exec_bash(args: dict) -> str:
         return f"[error: {e}]"
 
 
-async def _exec_read_file(args: dict) -> str:
+async def _exec_read_file(args: dict, *, image_callback=None) -> str:
     path = args["path"]
     offset = args.get("offset", 1)
     limit = args.get("limit")
@@ -404,6 +412,14 @@ async def _exec_read_file(args: dict) -> str:
             resolved = validate_workspace_path(path, _workspace_path, must_exist=True)
         else:
             resolved = Path(path)
+        # Image detection
+        if is_image(str(resolved)):
+            blocks = build_image_content_blocks(
+                str(resolved), annotation=f"[Image: {path}]"
+            )
+            if image_callback:
+                image_callback(blocks)
+            return f"[Read image: {path}]"
         with open(resolved, "r", errors="replace") as f:
             lines = f.readlines()
         start = max(0, offset - 1)
@@ -494,7 +510,7 @@ async def _exec_list_dir(args: dict) -> str:
         return f"[error: {e}]"
 
 
-async def _exec_web_fetch(args: dict) -> str:
+async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
     url = args["url"]
     if not re.match(r"^https?://", url):
         return "[error: URL must start with http:// or https://]"
@@ -503,6 +519,18 @@ async def _exec_web_fetch(args: dict) -> str:
             resp = await client.get(url, headers={"User-Agent": "BaalAgent/1.0"})
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
+            # Image detection by URL extension or content type
+            if is_image(urlparse(url).path) or content_type.startswith("image/"):
+                data_uri = encode_bytes_to_data_uri(
+                    resp.content, mime=content_type.split(";")[0] or "image/jpeg"
+                )
+                blocks: list[dict] = [
+                    {"type": "text", "text": f"[Image: {url}]"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ]
+                if image_callback:
+                    image_callback(blocks)
+                return f"[Fetched image: {url}]"
             text = resp.text
             if "json" in content_type:
                 try:
@@ -687,11 +715,13 @@ def get_tool_definitions(*, include_spawn: bool = True) -> list[dict]:
     return defs
 
 
-async def execute_tool(name: str, arguments: str | dict) -> str:
+async def execute_tool(name: str, arguments: str | dict, *, image_callback=None) -> str:
     """Dispatch a tool call by name. Returns the result string."""
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"[error: unknown tool '{name}']"
     if isinstance(arguments, str):
         arguments = json.loads(arguments)
+    if name in _IMAGE_AWARE_TOOLS and image_callback:
+        return await handler(arguments, image_callback=image_callback)
     return await handler(arguments)
