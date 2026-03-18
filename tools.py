@@ -94,7 +94,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file and return its contents with line numbers.",
+            "description": "Read a file and return its contents with line numbers. For image files (png, jpg, gif, webp, bmp), returns the image visually so you can see it.",
             "parameters": {
                 "type": "object",
                 "properties": {

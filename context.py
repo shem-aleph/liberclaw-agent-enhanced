@@ -49,6 +49,14 @@ def build_static_system_prompt(
         "- Read skill files for detailed instructions when a skill is relevant"
     )
 
+    # File and image handling
+    sections.append(
+        "## Files & Images\n\n"
+        "When the user sends a file or mentions an uploaded file, use `read_file` to examine it. "
+        "This works for images too: `read_file` on an image file (png, jpg, gif, webp, bmp) "
+        "lets you see the image contents. Never say you can't see an image without trying `read_file` first."
+    )
+
     # Skill creation nudge
     sections.append(
         "## Skill Creation\n\n"
