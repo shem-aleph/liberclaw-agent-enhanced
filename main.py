@@ -159,6 +159,7 @@ async def lifespan(app: FastAPI):
             db=db,
             agent_turn_callback=_telegram_agent_turn,
             cancel_run_callback=cancel_chat_run,
+            workspace_path=settings.workspace_path,
         )
         try:
             await _telegram_bot.start()
