@@ -656,6 +656,23 @@ async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
                 if image_callback:
                     image_callback(blocks)
                 return f"[Fetched image: {url}]"
+            # Binary content: download to workspace so tools like read_pdf can handle it
+            _BINARY_TYPES = ("application/pdf", "application/octet-stream",
+                             "application/zip", "audio/", "video/", "font/")
+            _MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+            if any(t in content_type for t in _BINARY_TYPES):
+                if len(resp.content) > _MAX_DOWNLOAD_SIZE:
+                    return f"[error: file too large ({len(resp.content)} bytes, max {_MAX_DOWNLOAD_SIZE // 1024 // 1024}MB)]"
+                import os
+                from pathlib import Path
+                ext = url.rsplit(".", 1)[-1].split("?")[0][:10] if "." in url else "bin"
+                filename = f"downloaded.{ext}"
+                ws = os.environ.get("WORKSPACE_PATH", "/workspace")
+                dl_path = Path(ws) / filename
+                dl_path.parent.mkdir(parents=True, exist_ok=True)
+                dl_path.write_bytes(resp.content)
+                hint = "Use read_pdf to read it." if ext == "pdf" else ""
+                return f"[Downloaded binary file ({content_type.split(';')[0]}, {len(resp.content)} bytes) to {filename}. {hint}]"
             text = resp.text
             if "json" in content_type:
                 try:
