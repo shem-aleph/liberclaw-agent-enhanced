@@ -409,8 +409,13 @@ _BINARY_MIME_PREFIXES = (
 )
 
 
+_MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+
+
 def _save_binary_download(content: bytes, url: str, content_type: str) -> str:
     """Save binary content to workspace/downloads/ and return a description."""
+    if len(content) > _MAX_DOWNLOAD_SIZE:
+        return f"[error: file too large ({len(content):,} bytes, max {_MAX_DOWNLOAD_SIZE // 1024 // 1024}MB)]"
     ct_display = content_type.split(";")[0].strip() if content_type else "unknown"
     if _workspace_path:
         downloads_dir = Path(_workspace_path) / "downloads"
