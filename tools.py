@@ -542,6 +542,11 @@ async def _exec_bash(args: dict) -> str:
         parts.append(f"[exit code: {code}]")
         return _truncate("\n".join(parts))
     except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
         return f"[timed out after {timeout}s]"
     except Exception as e:
         return f"[error: {e}]"

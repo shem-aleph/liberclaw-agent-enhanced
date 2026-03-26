@@ -965,15 +965,24 @@ async def upload_file(
         return JSONResponse(status_code=403, content={"error": str(e)})
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / file.filename
+    if not file.filename:
+        return JSONResponse(status_code=400, content={"error": "filename is required"})
+    safe_filename = Path(file.filename).name
+    target_file = target_dir / safe_filename
 
     content = await file.read()
     if len(content) > MAX_SEND_FILE_SIZE:
         return JSONResponse(status_code=413, content={"error": "File too large (50MB max)"})
 
+    # Validate final path is within workspace
+    try:
+        target_file.resolve().relative_to(workspace_root)
+    except ValueError:
+        return JSONResponse(status_code=403, content={"error": "Invalid filename"})
+
     target_file.write_bytes(content)
     rel = str(target_file.relative_to(workspace_root))
-    return {"path": rel, "size": len(content), "name": file.filename}
+    return {"path": rel, "size": len(content), "name": safe_filename}
 
 
 @app.get("/health")
