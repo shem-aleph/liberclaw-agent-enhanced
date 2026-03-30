@@ -468,6 +468,15 @@ async def _maybe_skill_nudge(
         if store_history:
             await db.add_message(chat_id, "assistant", text, tool_calls=tc_for_db)
 
+        # Append assistant message (with tool_calls) to messages list so
+        # subsequent tool result messages have the correct conversation structure
+        if tool_calls:
+            assistant_dict: dict = {"role": "assistant"}
+            if text:
+                assistant_dict["content"] = text
+            assistant_dict["tool_calls"] = tc_for_db
+            messages.append(assistant_dict)
+
         # Execute any tool calls (the agent may write a skill file)
         if tool_calls:
             for tc in tool_calls:

@@ -135,10 +135,10 @@ MEMORY_FLUSH_TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to workspace."},
-                    "old_text": {"type": "string", "description": "Text to find."},
-                    "new_text": {"type": "string", "description": "Text to replace with."},
+                    "old_string": {"type": "string", "description": "Text to find."},
+                    "new_string": {"type": "string", "description": "Text to replace with."},
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path", "old_string", "new_string"],
             },
         },
     },
