@@ -45,13 +45,20 @@ _db = None  # AgentDatabase instance, set via configure_tools
 _shell: PersistentShell | None = None
 _checkpoint_mgr: CheckpointManager | None = None
 _code_executor: CodeExecutor | None = None
+_mcp_client = None  # MCPClient instance, set via start_mcp
+_inference = None  # InferenceClient instance, for LLM-powered tools
+_model: str = ""  # Model name, for LLM-powered tools
 
 
-def configure_tools(workspace_path: str, db=None) -> None:
+def configure_tools(workspace_path: str, db=None, inference=None, model: str = "") -> None:
     """Set the workspace root and optional database for tool boundary checks."""
-    global _workspace_path, _db
+    global _workspace_path, _db, _inference, _model
     _workspace_path = workspace_path
     _db = db
+    if inference is not None:
+        _inference = inference
+    if model:
+        _model = model
 
 
 async def start_shell() -> None:
@@ -84,6 +91,41 @@ async def shutdown_code_executor() -> None:
     if _code_executor is not None:
         await _code_executor.stop()
         _code_executor = None
+
+
+async def start_mcp(mcp_servers_json: str) -> None:
+    """Parse MCP server config and connect to all configured servers."""
+    global _mcp_client
+    if not mcp_servers_json.strip():
+        return
+    try:
+        servers = json.loads(mcp_servers_json)
+    except json.JSONDecodeError as e:
+        import logging as _logging
+        _logging.getLogger(__name__).error(f"Invalid mcp_servers JSON: {e}")
+        return
+    if not isinstance(servers, list) or not servers:
+        return
+
+    from baal_agent.mcp_client import MCPClient
+    _mcp_client = MCPClient()
+    for srv in servers:
+        name = srv.get("name")
+        if not name:
+            continue
+        try:
+            await _mcp_client.connect(name, srv)
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).error(f"MCP server '{name}' connect failed: {e}")
+
+
+async def shutdown_mcp() -> None:
+    """Disconnect from all MCP servers. Safe to call even if not started."""
+    global _mcp_client
+    if _mcp_client is not None:
+        await _mcp_client.disconnect_all()
+        _mcp_client = None
 
 # ── Bash safety guards ────────────────────────────────────────────────
 # Legacy BASH_DENY_PATTERNS kept for backward compatibility with tests.
@@ -277,7 +319,8 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Search your past conversation history using full-text search. "
                 "Use this to recall what was discussed about a topic, find details "
-                "from previous conversations, or check if something was mentioned before."
+                "from previous conversations, or check if something was mentioned before. "
+                "Set summarize=true to get a synthesized answer instead of raw snippets."
             ),
             "parameters": {
                 "type": "object",
@@ -296,6 +339,10 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                         "description": "Maximum results to return (default 20, max 50).",
+                    },
+                    "summarize": {
+                        "type": "boolean",
+                        "description": "If true, use the LLM to synthesize a coherent answer from the search results instead of returning raw snippets.",
                     },
                 },
                 "required": ["query"],
@@ -1056,6 +1103,7 @@ async def _exec_search_history(args: dict) -> str:
         return "[error: conversation search not available]"
     chat_id = args.get("chat_id")
     limit = min(args.get("limit", 20), 50)
+    summarize = args.get("summarize", False)
     try:
         results = await _db.search_history(query, chat_id=chat_id, limit=limit)
     except Exception as e:
@@ -1067,7 +1115,29 @@ async def _exec_search_history(args: dict) -> str:
         lines.append(f"[{r['created_at']}] ({r['role']}, chat: {r['chat_id']}):")
         lines.append(r["snippet"])
         lines.append("")
-    return _truncate("\n".join(lines), source="search_history")
+    raw_output = "\n".join(lines)
+
+    if summarize and _inference and _model:
+        try:
+            summary_prompt = (
+                f'Based on the following search results from conversation history, '
+                f'provide a coherent summary that answers the query "{query}":\n\n'
+                f'{raw_output}\n\n'
+                f'Synthesize the key information concisely.'
+            )
+            response = await _inference.chat(
+                messages=[{"role": "user", "content": summary_prompt}],
+                model=_model,
+            )
+            summary = response.content
+            if summary:
+                return summary
+        except Exception as e:
+            # Fall back to raw results on summarization failure
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"Search summarization failed: {e}")
+
+    return _truncate(raw_output, source="search_history")
 
 
 async def _exec_web_search(args: dict) -> str:
@@ -1640,10 +1710,12 @@ TOOL_HANDLERS: dict[str, callable] = {
 
 
 def get_tool_definitions(*, include_spawn: bool = True) -> list[dict]:
-    """Return tool definitions, optionally including spawn."""
+    """Return tool definitions, optionally including spawn and MCP tools."""
     defs = list(TOOL_DEFINITIONS)
     if include_spawn:
         defs.append(SPAWN_TOOL_DEF)
+    if _mcp_client is not None:
+        defs.extend(_mcp_client.get_tool_definitions())
     return defs
 
 
@@ -1661,11 +1733,19 @@ async def execute_tool(
     matches are replaced with ``[REDACTED:type]`` tokens.  Code blocks
     inside fenced ``` markers are left untouched.
     """
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+
+    # Route MCP tool calls to the MCP client
+    if name.startswith("mcp_") and _mcp_client is not None:
+        result = await _mcp_client.call_tool(name, arguments)
+        if pii_redaction:
+            result = redact_pii(result)
+        return result
+
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"[error: unknown tool '{name}']"
-    if isinstance(arguments, str):
-        arguments = json.loads(arguments)
     if name in _IMAGE_AWARE_TOOLS and image_callback:
         result = await handler(arguments, image_callback=image_callback)
     else:

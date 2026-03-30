@@ -29,3 +29,4 @@ class AgentSettings(BaseSettings):
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
     pii_redaction_enabled: bool = True  # redact PII from tool outputs
+    mcp_servers: str = ""  # JSON: [{"name": "...", "transport": "stdio", "command": "...", "args": [...], "env": {...}}]

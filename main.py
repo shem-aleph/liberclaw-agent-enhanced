@@ -30,9 +30,11 @@ from baal_agent.tools import (
     execute_tool,
     get_tool_definitions,
     shutdown_code_executor,
+    shutdown_mcp,
     shutdown_processes,
     shutdown_shell,
     start_code_executor,
+    start_mcp,
     start_shell,
 )
 
@@ -152,9 +154,10 @@ async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str |
 async def lifespan(app: FastAPI):
     global _scheduler, _plugin_manager, _telegram_bot, _telegram_bot_task
     await db.initialize()
-    configure_tools(settings.workspace_path, db=db)
+    configure_tools(settings.workspace_path, db=db, inference=inference, model=settings.model)
     await start_shell()
     await start_code_executor()
+    await start_mcp(settings.mcp_servers)
 
     # Ensure workspace directories exist
     workspace = Path(settings.workspace_path)
@@ -206,6 +209,7 @@ async def lifespan(app: FastAPI):
     for run in _active_runs.values():
         if not run.done and not run.task.done():
             run.task.cancel()
+    await shutdown_mcp()
     await shutdown_processes()
     await shutdown_code_executor()
     await shutdown_shell()
