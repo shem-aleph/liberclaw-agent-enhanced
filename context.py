@@ -44,9 +44,20 @@ def build_static_system_prompt(
         "You have persistent memory. To remember things across conversations:\n"
         f"- Long-term: Write to `{workspace_path}/memory/MEMORY.md` using write_file or edit_file\n"
         f"- Daily notes: Write to `{workspace_path}/memory/{today}.md`\n"
-        "- Save user preferences, project context, and important facts to MEMORY.md\n"
+        f"- User profile: Write to `{workspace_path}/memory/USER.md`\n"
+        "- Save project context and important facts to MEMORY.md\n"
         "- Save session-specific notes to daily files\n"
-        "- Read skill files for detailed instructions when a skill is relevant"
+        "- Read skill files for detailed instructions when a skill is relevant\n\n"
+        "### User Profile (USER.md)\n\n"
+        "Create and maintain USER.md to remember who you're working with. Update it "
+        "when you learn new things about the user. Include:\n"
+        "- Communication style preferences (concise vs detailed, formal vs casual)\n"
+        "- Technical expertise level and domains\n"
+        "- Timezone and locale\n"
+        "- Preferred languages, frameworks, or tools\n"
+        "- Any stated preferences or recurring requests\n\n"
+        "Project context files (CONTEXT.md, AGENTS.md, .hermes.md, CLAUDE.md) "
+        "in the workspace root are automatically loaded into your context if present."
     )
 
     # File and image handling
@@ -73,18 +84,31 @@ def build_static_system_prompt(
         "Only do this for genuinely reusable procedures, not one-off tasks."
     )
 
-    # Heartbeat system (only when enabled)
+    # Scheduling system
+    sections.append(
+        "## Cron Scheduler\n\n"
+        "You have a cron scheduler that runs jobs defined in "
+        f"`{workspace_path}/cron.json`. Each job has an id, schedule (standard "
+        "5-field cron expression: minute hour day-of-month month day-of-week), "
+        "task (message sent to you), and enabled flag.\n\n"
+        "Example cron.json:\n"
+        '```json\n[\n  {"id": "daily-check", "schedule": "0 9 * * *", '
+        '"task": "Check GitHub PRs", "enabled": true}\n]\n```\n\n'
+        "- Create/edit cron.json with your file tools to self-schedule recurring tasks\n"
+        "- Supports: `*`, ranges (`1-5`), lists (`1,3,5`), steps (`*/5`)\n"
+        "- Jobs run at most once per minute; disabled jobs are skipped\n"
+        "- Each job runs as a separate conversation (chat_id: `__cron_<id>__`)"
+    )
+    # Legacy heartbeat fallback (only when enabled and no cron.json)
     if heartbeat_interval > 0:
         interval_min = max(1, heartbeat_interval // 60)
         sections.append(
-            "## Heartbeat System\n\n"
-            f"Every {interval_min} minutes, your heartbeat runs automatically. "
-            f"It reads `{workspace_path}/HEARTBEAT.md` and follows the checklist there.\n\n"
-            "- To enable: create HEARTBEAT.md with a short checklist of periodic tasks\n"
-            "- Keep it small (it becomes part of your prompt each cycle)\n"
+            "## Legacy Heartbeat\n\n"
+            f"If no `cron.json` exists, a legacy heartbeat checks "
+            f"`{workspace_path}/HEARTBEAT.md` every {interval_min} minutes.\n\n"
+            "- Create HEARTBEAT.md with a checklist of periodic tasks\n"
             "- If nothing needs attention, reply with just: HEARTBEAT_OK\n"
-            "- You can update HEARTBEAT.md yourself to adjust what gets checked\n"
-            "- Results are stored in your heartbeat history"
+            "- Prefer using cron.json for new scheduled tasks"
         )
 
     return "\n\n---\n\n".join(sections)
@@ -99,6 +123,11 @@ def build_dynamic_context(workspace_path: str) -> str:
     workspace = Path(workspace_path)
     sections = []
 
+    # User profile (loaded before memory for prominence)
+    user_profile = _load_user_profile(workspace)
+    if user_profile:
+        sections.append(f"## User Profile\n\n{user_profile}")
+
     memory = _load_memory(workspace)
     if memory:
         sections.append(f"## Memory\n\n{memory}")
@@ -106,6 +135,10 @@ def build_dynamic_context(workspace_path: str) -> str:
     skills = _load_skills_summary(workspace)
     if skills:
         sections.append(f"## Available Skills\n\n{skills}")
+
+    context_files = _load_context_files(workspace)
+    if context_files:
+        sections.append(f"## Project Context\n\n{context_files}")
 
     return "\n\n---\n\n".join(sections) if sections else ""
 
@@ -167,6 +200,54 @@ def build_subagent_prompt(
     )
 
     return "\n\n---\n\n".join(sections)
+
+
+def _load_user_profile(workspace: Path) -> str:
+    """Load workspace/memory/USER.md if it exists."""
+    user_file = workspace / "memory" / "USER.md"
+    if user_file.exists():
+        content = user_file.read_text().strip()
+        if content:
+            return content
+    return ""
+
+
+_CONTEXT_FILENAMES = ("CONTEXT.md", "AGENTS.md", ".hermes.md", "CLAUDE.md")
+_CONTEXT_MAX_CHARS = 20_000
+
+
+def _load_context_files(workspace: Path) -> str:
+    """Scan workspace root for project context files.
+
+    Checks for files in priority order and loads ALL that exist,
+    enforcing a total size limit to avoid bloating the context.
+    """
+    parts: list[str] = []
+    total = 0
+
+    for filename in _CONTEXT_FILENAMES:
+        path = workspace / filename
+        if not path.exists():
+            continue
+        content = path.read_text().strip()
+        if not content:
+            continue
+
+        header = f"### {filename}"
+        entry = f"{header}\n\n{content}"
+
+        if total + len(entry) > _CONTEXT_MAX_CHARS:
+            remaining = _CONTEXT_MAX_CHARS - total
+            if remaining > len(header) + 50:
+                truncated = entry[:remaining]
+                truncated += f"\n\n... (truncated — {filename} exceeded context limit)"
+                parts.append(truncated)
+            break
+
+        parts.append(entry)
+        total += len(entry)
+
+    return "\n\n".join(parts)
 
 
 def _load_memory(workspace: Path) -> str:
