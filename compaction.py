@@ -260,12 +260,12 @@ async def maybe_compact(
     )
 
     # Dynamic keep: scale down under extreme context pressure (Task 1.3)
+    # Gradient from keep_max (at trigger) to keep_min (at budget).
+    # pressure=0 at trigger, pressure=1 at budget.
     keep_max = settings.compaction_keep_messages
-    keep = max(
-        settings.compaction_keep_min,
-        int(keep_max * (budget - tokens) / budget),
-    )
-    keep = min(keep, keep_max)  # never exceed configured max
+    pressure = min(1.0, (tokens - trigger) / max(1, budget - trigger))
+    keep = int(keep_max - pressure * (keep_max - settings.compaction_keep_min))
+    keep = max(settings.compaction_keep_min, min(keep, keep_max))
     if keep < keep_max:
         logger.info(f"Context pressure: keeping {keep} messages (max={keep_max})")
 

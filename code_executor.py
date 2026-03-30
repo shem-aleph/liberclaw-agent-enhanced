@@ -100,8 +100,12 @@ class CodeExecutor:
             else:
                 tool_name = params.get("name")
                 tool_args = params.get("arguments", {})
+                # Block recursive/dangerous tools from execute_code scripts
+                _BLOCKED_TOOLS = {"execute_code", "spawn"}
                 if not tool_name:
                     response = {"error": "missing tool name", "id": req_id}
+                elif tool_name in _BLOCKED_TOOLS:
+                    response = {"error": f"tool '{tool_name}' is not available from execute_code", "id": req_id}
                 else:
                     # Import here to avoid circular import at module level
                     from baal_agent.tools import execute_tool
@@ -151,7 +155,10 @@ class CodeExecutor:
                 f.write(code)
                 f.write("\n")
 
-            env = {**os.environ, "BAAL_TOOL_SOCKET": self._socket_path}
+            # Strip sensitive env vars from child process
+            _sensitive = {"AGENT_SECRET_HASH", "LIBERTAI_API_KEY", "TELEGRAM_BOT_TOKEN", "OWNER_TELEGRAM_ID"}
+            env = {k: v for k, v in os.environ.items() if k not in _sensitive}
+            env["BAAL_TOOL_SOCKET"] = self._socket_path
 
             proc = await asyncio.create_subprocess_exec(
                 "python3",

@@ -473,6 +473,16 @@ async def _maybe_skill_nudge(
                 )
                 if store_history:
                     await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+            # Let the model see the tool results and produce a final response
+            try:
+                final = await inference.chat(messages=messages, model=settings.model, tools=None)
+                if final.content and store_history:
+                    await db.add_message(chat_id, "assistant", final.content)
+                return final.content
+            except Exception:
+                pass  # If follow-up fails, return the original text
 
         return text
     except Exception as e:

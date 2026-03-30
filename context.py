@@ -205,10 +205,13 @@ def build_subagent_prompt(
 def _load_user_profile(workspace: Path) -> str:
     """Load workspace/memory/USER.md if it exists."""
     user_file = workspace / "memory" / "USER.md"
-    if user_file.exists():
-        content = user_file.read_text().strip()
-        if content:
-            return content
+    try:
+        if user_file.exists():
+            content = user_file.read_text().strip()
+            if content:
+                return content
+    except (OSError, UnicodeDecodeError):
+        pass  # Corrupted or unreadable file — skip silently
     return ""
 
 
@@ -229,7 +232,10 @@ def _load_context_files(workspace: Path) -> str:
         path = workspace / filename
         if not path.exists():
             continue
-        content = path.read_text().strip()
+        try:
+            content = path.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            continue  # Skip unreadable files
         if not content:
             continue
 
@@ -256,18 +262,24 @@ def _load_memory(workspace: Path) -> str:
 
     # Long-term memory
     memory_file = workspace / "memory" / "MEMORY.md"
-    if memory_file.exists():
-        content = memory_file.read_text().strip()
-        if content:
-            parts.append(f"### Long-term Memory\n\n{content}")
+    try:
+        if memory_file.exists():
+            content = memory_file.read_text().strip()
+            if content:
+                parts.append(f"### Long-term Memory\n\n{content}")
+    except (OSError, UnicodeDecodeError):
+        pass
 
     # Today's daily notes
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_file = workspace / "memory" / f"{today}.md"
-    if daily_file.exists():
-        content = daily_file.read_text().strip()
-        if content:
-            parts.append(f"### Today's Notes ({today})\n\n{content}")
+    try:
+        if daily_file.exists():
+            content = daily_file.read_text().strip()
+            if content:
+                parts.append(f"### Today's Notes ({today})\n\n{content}")
+    except (OSError, UnicodeDecodeError):
+        pass
 
     return "\n\n".join(parts)
 
@@ -285,8 +297,12 @@ def _load_skills_summary(workspace: Path) -> str:
         skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             continue
+        try:
+            skill_content = skill_file.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
         name, description = _parse_skill_metadata(
-            skill_dir.name, skill_file.read_text()
+            skill_dir.name, skill_content
         )
         lines.append(f"- **{name}**: {description} (read `{skill_file}` for details)")
 

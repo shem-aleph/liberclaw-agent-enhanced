@@ -7,8 +7,8 @@ define hook functions that are called at various points in the agent lifecycle:
 - ``on_session_end(chat_id: str) -> None``
 - ``pre_inference(messages: list[dict]) -> list[dict]``
 - ``post_inference(response_text: str) -> str``
-- ``pre_tool(tool_name: str, arguments: dict) -> dict``
-- ``post_tool(tool_name: str, result: str) -> str``
+- ``pre_tool(arguments: dict, tool_name: str) -> dict``
+- ``post_tool(result: str, tool_name: str) -> str``
 
 A broken plugin never crashes the agent -- all hook calls are wrapped in
 try/except and failures are logged as warnings.
