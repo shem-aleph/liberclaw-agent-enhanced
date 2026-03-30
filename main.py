@@ -23,7 +23,18 @@ from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
 from baal_agent.telegram_bot import TelegramBot
-from baal_agent.tools import configure_tools, execute_tool, get_tool_definitions
+from baal_agent.plugins import PluginManager
+from baal_agent.scheduler import CronScheduler
+from baal_agent.tools import (
+    configure_tools,
+    execute_tool,
+    get_tool_definitions,
+    shutdown_code_executor,
+    shutdown_processes,
+    shutdown_shell,
+    start_code_executor,
+    start_shell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +42,8 @@ settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
 
-_heartbeat_task: asyncio.Task | None = None
+_scheduler: CronScheduler | None = None
+_plugin_manager: PluginManager | None = None
 _telegram_bot: TelegramBot | None = None
 _telegram_bot_task: asyncio.Task | None = None
 
@@ -138,18 +150,26 @@ async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str |
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _heartbeat_task, _telegram_bot, _telegram_bot_task
+    global _scheduler, _plugin_manager, _telegram_bot, _telegram_bot_task
     await db.initialize()
     configure_tools(settings.workspace_path, db=db)
+    await start_shell()
+    await start_code_executor()
 
     # Ensure workspace directories exist
     workspace = Path(settings.workspace_path)
     (workspace / "memory").mkdir(parents=True, exist_ok=True)
     (workspace / "skills").mkdir(parents=True, exist_ok=True)
 
-    # Start heartbeat if configured
-    if settings.heartbeat_interval > 0:
-        _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    # Load plugins from workspace/plugins/
+    _plugin_manager = PluginManager(settings.workspace_path)
+    _plugin_manager.load_plugins()
+
+    # Start cron scheduler (replaces old heartbeat loop).
+    # It reads workspace/cron.json every tick and falls back to the legacy
+    # HEARTBEAT.md behaviour when no cron.json exists.
+    _scheduler = CronScheduler(settings.workspace_path, heartbeat_interval=settings.heartbeat_interval)
+    await _scheduler.start(_run_cron_job)
 
     # Start Telegram bot if configured
     if settings.telegram_bot_token:
@@ -180,16 +200,15 @@ async def lifespan(app: FastAPI):
     if _telegram_bot:
         await _telegram_bot.stop()
 
-    if _heartbeat_task and not _heartbeat_task.done():
-        _heartbeat_task.cancel()
-        try:
-            await _heartbeat_task
-        except asyncio.CancelledError:
-            pass
+    if _scheduler:
+        await _scheduler.stop()
     # Cancel all active chat runs
     for run in _active_runs.values():
         if not run.done and not run.task.done():
             run.task.cancel()
+    await shutdown_processes()
+    await shutdown_code_executor()
+    await shutdown_shell()
     await db.close()
 
 
@@ -284,6 +303,7 @@ async def _run_agent_turn(
         messages.append({"role": "user", "content": message})
 
     final_text = None
+    total_tool_calls = 0
 
     for _iteration in range(iterations):
         assistant_msg = await inference.chat(
@@ -295,6 +315,7 @@ async def _run_agent_turn(
 
         tc_for_db = None
         if tool_calls:
+            total_tool_calls += len(tool_calls)
             tc_for_db = [
                 {
                     "id": tc.id,
@@ -321,17 +342,49 @@ async def _run_agent_turn(
             final_text = text_content
 
         if not tool_calls:
+            # Auto-skill nudge (Task 1.4): if the turn used many tools,
+            # ask the agent to consider saving the procedure as a skill.
+            skill_text = await _maybe_skill_nudge(
+                total_tool_calls, messages, chat_id, store_history, tools,
+            )
+            if skill_text:
+                final_text = skill_text
             return final_text
 
-        for tc in tool_calls:
-            name = tc.function.name
+        # Execute tool calls concurrently
+        async def _exec_tool(tc):
+            tool_name = tc.function.name
             arguments = tc.function.arguments
 
-            # Handle spawn tool specially
-            if name == "spawn" and not restricted:
+            # Plugin pre_tool hook
+            if _plugin_manager is not None:
+                arguments = await _plugin_manager.fire_modify(
+                    "pre_tool", arguments, tool_name,
+                )
+
+            if tool_name == "spawn" and not restricted:
                 result = await _handle_spawn(arguments, chat_id)
             else:
-                result = await execute_tool(name, arguments, image_callback=_stash_images)
+                result = await execute_tool(
+                    tool_name, arguments,
+                    image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                )
+
+            # Plugin post_tool hook
+            if _plugin_manager is not None:
+                result = await _plugin_manager.fire_modify(
+                    "post_tool", result, tool_name,
+                )
+
+            return result
+
+        results = await asyncio.gather(
+            *[_exec_tool(tc) for tc in tool_calls], return_exceptions=True
+        )
+
+        for tc, result in zip(tool_calls, results):
+            if isinstance(result, BaseException):
+                result = f"Error executing {tc.function.name}: {result}"
 
             # Detect send_file markers and accumulate for callers
             if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -356,6 +409,75 @@ async def _run_agent_turn(
             pending_images.clear()
 
     return final_text
+
+
+# ── Auto-skill nudge ─────────────────────────────────────────────────
+
+async def _maybe_skill_nudge(
+    total_tool_calls: int,
+    messages: list[dict],
+    chat_id: str,
+    store_history: bool,
+    tools: list[dict],
+) -> str | None:
+    """If the turn used many tools, nudge the agent to consider saving a skill.
+
+    Runs one additional inference iteration so the agent can decide whether
+    to create a skill file. Returns the agent's text response if any.
+    """
+    threshold = settings.auto_skill_threshold
+    if threshold <= 0 or total_tool_calls < threshold:
+        return None
+
+    nudge = (
+        f"[System] You completed a complex task with {total_tool_calls} tool calls. "
+        f"If this procedure might be useful again, consider saving it as a skill at "
+        f"workspace/skills/<name>/SKILL.md with YAML frontmatter (name, description)."
+    )
+
+    if store_history:
+        await db.add_message(chat_id, "user", nudge)
+    messages.append({"role": "user", "content": nudge})
+
+    try:
+        response = await inference.chat(
+            messages=messages, model=settings.model, tools=tools
+        )
+
+        text = response.content
+        tool_calls = response.tool_calls
+
+        tc_for_db = None
+        if tool_calls:
+            tc_for_db = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+
+        if store_history:
+            await db.add_message(chat_id, "assistant", text, tool_calls=tc_for_db)
+
+        # Execute any tool calls (the agent may write a skill file)
+        if tool_calls:
+            for tc in tool_calls:
+                result = await execute_tool(
+                    tc.function.name, tc.function.arguments,
+                    pii_redaction=settings.pii_redaction_enabled,
+                )
+                if store_history:
+                    await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
+
+        return text
+    except Exception as e:
+        logger.warning(f"Auto-skill nudge inference failed: {e}")
+        return None
 
 
 # ── Spawn / subagent ──────────────────────────────────────────────────
@@ -482,55 +604,25 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         )
 
 
-# ── Heartbeat ─────────────────────────────────────────────────────────
+# ── Cron job callback ────────────────────────────────────────────────
 
-def _is_heartbeat_empty(content: str) -> bool:
-    """Check if heartbeat file has no actionable content."""
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("<!--") and stripped.endswith("-->"):
-            continue
-        # Unchecked checkbox counts as actionable
-        if stripped.startswith("- [ ]"):
-            return False
-        # Any non-header, non-comment text is actionable
-        return False
-    return True
-
-
-async def _heartbeat_loop():
-    """Periodic heartbeat — check HEARTBEAT.md and run tasks."""
-    while True:
-        await asyncio.sleep(settings.heartbeat_interval)
-        try:
-            heartbeat_file = Path(settings.workspace_path) / "HEARTBEAT.md"
-            if not heartbeat_file.exists():
-                continue
-            content = heartbeat_file.read_text()
-            if _is_heartbeat_empty(content):
-                continue
-
-            files: list[dict] = []
-            result = await _run_agent_turn(
-                "Read HEARTBEAT.md and follow any instructions or tasks listed there. "
-                "If nothing needs attention, reply with just: HEARTBEAT_OK",
-                chat_id="__heartbeat__",
-                store_history=True,
-                file_events=files,
-            )
-
-            if result:
-                is_ok = "HEARTBEAT_OK" in result.upper().replace("_", "")
-                if is_ok:
-                    logger.debug("Heartbeat: nothing to report")
-                else:
-                    logger.info(f"Heartbeat produced output ({len(result)} chars)")
-        except Exception as e:
-            logger.error(f"Heartbeat error: {e}")
+async def _run_cron_job(task: str, job_id: str):
+    """Callback invoked by the CronScheduler for each due job."""
+    chat_id = f"__cron_{job_id}__"
+    files: list[dict] = []
+    try:
+        result = await _run_agent_turn(
+            task,
+            chat_id=chat_id,
+            store_history=True,
+            file_events=files,
+        )
+        if result:
+            logger.info(f"Cron job {job_id!r} produced output ({len(result)} chars)")
+        else:
+            logger.debug(f"Cron job {job_id!r}: no output")
+    except Exception as e:
+        logger.error(f"Cron job {job_id!r} failed: {e}")
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────
@@ -604,6 +696,11 @@ async def _emit(run: ChatRun, data: dict):
 async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[dict]):
     """Background agentic loop — emits SSE events to run.events buffer."""
     try:
+        # Reload plugins so newly created plugins take effect immediately
+        if _plugin_manager is not None:
+            _plugin_manager.load_plugins()
+            await _plugin_manager.fire("on_session_start", chat_id)
+
         tools = get_tool_definitions(include_spawn=True)
         tool_names = [t["function"]["name"] for t in tools]
         pending_images: list[dict] = []
@@ -628,6 +725,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
         )
 
         inference_timeout = settings.inference_timeout
+        total_tool_calls = 0
 
         for _iteration in range(settings.max_tool_iterations):
             # Call inference with loop-level retry.
@@ -674,6 +772,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
 
             tc_for_db = None
             if tool_calls:
+                total_tool_calls += len(tool_calls)
                 tc_for_db = [
                     {
                         "id": tc.id,
@@ -701,25 +800,57 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 await _emit(run, {"type": "text", "content": text_content})
 
             if not tool_calls:
+                # Auto-skill nudge for SSE path
+                skill_text = await _maybe_skill_nudge(
+                    total_tool_calls, messages, chat_id,
+                    store_history=True, tools=tools,
+                )
+                if skill_text:
+                    await _emit(run, {"type": "text", "content": skill_text})
                 return
 
+            # Emit tool_use SSE events for all tools before execution
             for tc in tool_calls:
-                name = tc.function.name
+                await _emit(run, {"type": "tool_use", "name": tc.function.name, "input": tc.function.arguments})
+
+            # Execute tool calls concurrently
+            async def _exec_tool_sse(tc):
+                tool_name = tc.function.name
                 arguments = tc.function.arguments
-                await _emit(run, {"type": "tool_use", "name": name, "input": arguments})
 
-                if name == "spawn":
-                    coro = _handle_spawn(arguments, chat_id)
-                else:
-                    coro = execute_tool(name, arguments, image_callback=_stash_images)
-
-                try:
-                    result = await coro
-                except Exception as tool_error:
-                    logger.error(
-                        f"Tool {name} raised: {tool_error}", exc_info=tool_error
+                # Plugin pre_tool hook: may modify arguments
+                if _plugin_manager is not None:
+                    arguments = await _plugin_manager.fire_modify(
+                        "pre_tool", arguments, tool_name,
                     )
-                    result = f"Error executing {name}: {tool_error}"
+
+                if tool_name == "spawn":
+                    result = await _handle_spawn(arguments, chat_id)
+                else:
+                    result = await execute_tool(
+                        tool_name, arguments,
+                        image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                    )
+
+                # Plugin post_tool hook: may modify result
+                if _plugin_manager is not None:
+                    result = await _plugin_manager.fire_modify(
+                        "post_tool", result, tool_name,
+                    )
+
+                return result
+
+            results = await asyncio.gather(
+                *[_exec_tool_sse(tc) for tc in tool_calls], return_exceptions=True
+            )
+
+            # Process results in original order
+            for tc, result in zip(tool_calls, results):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        f"Tool {tc.function.name} raised: {result}", exc_info=result
+                    )
+                    result = f"Error executing {tc.function.name}: {result}"
 
                 # Detect send_file markers and emit file SSE event
                 if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -756,6 +887,12 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
         except asyncio.CancelledError:
             run.events.append({"type": "error", "content": str(e)})
     finally:
+        # Fire session end hook (best-effort)
+        if _plugin_manager is not None:
+            try:
+                await _plugin_manager.fire("on_session_end", chat_id)
+            except Exception:
+                pass  # never let plugin errors block cleanup
         # Always emit done and mark run as finished — force-append to avoid
         # re-cancellation in the finally block leaving run.done=False forever
         run.events.append({"type": "done"})
