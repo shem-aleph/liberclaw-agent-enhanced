@@ -82,7 +82,9 @@ class MCPClient:
 
         try:
             import os
-            proc_env = {**os.environ, **(env or {})}
+            _sensitive = {"AGENT_SECRET_HASH", "LIBERTAI_API_KEY", "TELEGRAM_BOT_TOKEN", "OWNER_TELEGRAM_ID"}
+            proc_env = {k: v for k, v in os.environ.items() if k not in _sensitive}
+            proc_env.update(env or {})
 
             process = await asyncio.create_subprocess_exec(
                 command, *args,
