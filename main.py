@@ -1,7 +1,9 @@
 """FastAPI application deployed to each agent VM."""
 
 import asyncio
+import base64
 import hashlib
+import hmac as _hmac
 import json
 import logging
 import secrets
@@ -223,8 +225,8 @@ app = FastAPI(title=f"Baal Agent: {settings.agent_name}", lifespan=lifespan)
 
 @app.middleware("http")
 async def verify_auth(request: Request, call_next):
-    """Reject requests without a valid Bearer token (except /health)."""
-    if request.url.path == "/health":
+    """Reject requests without a valid Bearer token (except /health and /dl/)."""
+    if request.url.path == "/health" or request.url.path.startswith("/dl/"):
         return await call_next(request)
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     token_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
@@ -1084,6 +1086,74 @@ async def serve_file(file_path: str):
         return FileResponse(resolved, filename=resolved.name)
     except PathSecurityError as e:
         return JSONResponse(status_code=403, content={"error": str(e)})
+
+
+# ── Direct download tokens ──────────────────────────────────────────
+# Short-lived HMAC tokens that let users download files directly from
+# the VM without proxying through the LiberClaw API.
+
+_DOWNLOAD_TOKEN_TTL = 300  # 5 minutes
+
+
+def _sign_download_token(file_path: str, expires: int) -> str:
+    """Create an HMAC-SHA256 signature for a download token."""
+    msg = f"{file_path}\n{expires}".encode()
+    return _hmac.new(
+        settings.agent_secret_hash.encode(), msg, hashlib.sha256
+    ).hexdigest()
+
+
+@app.post("/files/token")
+async def create_download_token(request: Request):
+    """Generate a short-lived download token for a file (requires auth)."""
+    body = await request.json()
+    file_path = body.get("path", "")
+    if not file_path:
+        return JSONResponse(status_code=400, content={"error": "path is required"})
+    # Validate the file exists and is safe to serve
+    try:
+        validate_workspace_path(
+            file_path, settings.workspace_path, must_exist=True, reject_sensitive=True
+        )
+    except PathSecurityError as e:
+        return JSONResponse(status_code=403, content={"error": str(e)})
+    expires = int(time.time()) + _DOWNLOAD_TOKEN_TTL
+    sig = _sign_download_token(file_path, expires)
+    token = f"{file_path}:{expires}:{sig}"
+    url_token = base64.urlsafe_b64encode(token.encode()).decode()
+    return {"token": url_token, "expires_in": _DOWNLOAD_TOKEN_TTL}
+
+
+@app.get("/dl/{token}")
+async def direct_download(token: str):
+    """Serve a file using a short-lived signed token (no auth required)."""
+    try:
+        decoded = base64.urlsafe_b64decode(token).decode()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    parts = decoded.rsplit(":", 2)
+    if len(parts) != 3:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    file_path, expires_str, sig = parts
+    try:
+        expires = int(expires_str)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    if time.time() > expires:
+        return JSONResponse(status_code=410, content={"error": "token expired"})
+    expected_sig = _sign_download_token(file_path, expires)
+    if not _hmac.compare_digest(sig, expected_sig):
+        return JSONResponse(status_code=403, content={"error": "invalid signature"})
+    try:
+        resolved = validate_workspace_path(
+            file_path, settings.workspace_path, must_exist=True, reject_sensitive=True
+        )
+        # Sanitize filename for Content-Disposition header
+        import re as _re
+        safe_name = _re.sub(r'[^\w\-. ]', '', resolved.name).strip() or "download"
+        return FileResponse(resolved, filename=safe_name)
+    except PathSecurityError:
+        return JSONResponse(status_code=403, content={"error": "access denied"})
 
 
 @app.get("/workspace/tree")
