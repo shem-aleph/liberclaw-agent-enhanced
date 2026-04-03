@@ -1160,18 +1160,43 @@ async def _exec_web_search(args: dict) -> str:
             resp.raise_for_status()
             data = resp.json()
             results = data.get("results", [])
+            meta = data.get("meta", {})
+            failed = meta.get("engines_failed", [])
+            used = meta.get("engines_used", [])
+            requested = ["google", "bing", "duckduckgo"]
+
+            # All engines failed — no usable results
+            if len(failed) >= len(requested) or (not results and failed):
+                return (
+                    "[error: all search engines failed — search service is "
+                    "currently unavailable. Use web_fetch to search specific "
+                    "sites directly instead, e.g.:\n"
+                    "- https://arxiv.org/search/?query=YOUR+QUERY\n"
+                    "- https://scholar.google.com/scholar?q=YOUR+QUERY\n"
+                    "- https://en.wikipedia.org/wiki/TOPIC]"
+                )
+
             if not results:
                 return "(no results found)"
+
             lines = []
+
+            # Prominent warning when most engines are down
+            if len(failed) >= 2:
+                lines.append(
+                    f"[warning: {len(failed)}/{len(requested)} search engines "
+                    f"failed ({', '.join(failed)}). Only {', '.join(used)} "
+                    "returned results — quality may be poor. Consider using "
+                    "web_fetch on specific sites for better results.]"
+                )
+                lines.append("")
+
             for r in results:
                 title = r.get("title", "")
                 url = r.get("url", "")
                 snippet = r.get("snippet", "")
                 lines.append(f"**{title}**\n{url}\n{snippet}\n")
-            # Note any engine failures
-            meta = data.get("meta", {})
-            failed = meta.get("engines_failed", [])
-            if failed:
+            if failed and len(failed) < 2:
                 lines.append(f"(engines failed: {', '.join(failed)})")
             return "\n".join(lines)
     except Exception as e:
