@@ -82,7 +82,7 @@ All settings via environment variables:
 | `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks (0 to disable) |
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
-| `INFERENCE_TIMEOUT` | `180` | Seconds before inference timeout |
+| `INFERENCE_TIMEOUT` | `300` | Seconds before inference timeout |
 
 ## License
 
