@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, field_validator
 
@@ -230,16 +232,37 @@ app = FastAPI(title=f"Baal Agent: {settings.agent_name}", lifespan=lifespan)
 
 # ── Auth middleware ────────────────────────────────────────────────────
 
+PUBLIC_PREFIXES = ("/dl/", "/assets/", "/static/")
+PUBLIC_PATHS = {"/health", "/", "/index.html", "/favicon.ico", "/manifest.json"}
+
+
 @app.middleware("http")
 async def verify_auth(request: Request, call_next):
-    """Reject requests without a valid Bearer token (except /health and /dl/)."""
-    if request.url.path == "/health" or request.url.path.startswith("/dl/"):
+    """Reject requests without a valid Bearer token, except public paths."""
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
         return await call_next(request)
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     token_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
     if not token or not secrets.compare_digest(token_hash, settings.agent_secret_hash):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
+
+
+# ── CORS (registered last so it wraps auth as the outermost layer) ─────
+
+if settings.local_ui_enabled:
+    _cors_origins = [o.strip() for o in settings.local_ui_cors_origins.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins or ["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        expose_headers=["Content-Type"],
+    )
 
 
 # ── Core agentic loop ─────────────────────────────────────────────────
@@ -1229,6 +1252,18 @@ async def health():
     return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": ["vision"]}
 
 
+@app.get("/info")
+async def info():
+    return {
+        "agent_name": settings.agent_name,
+        "model": settings.model,
+        "system_prompt": settings.system_prompt,
+        "capabilities": ["vision"],
+        "tools": [t["function"]["name"] for t in get_tool_definitions(include_spawn=True)],
+        "heartbeat_interval": settings.heartbeat_interval,
+    }
+
+
 # ── Subagent management endpoints ─────────────────────────────────────
 
 @app.get("/subagents")
@@ -1355,3 +1390,15 @@ async def delete_telegram_contact(telegram_id: str):
     if not deleted:
         return JSONResponse(status_code=404, content={"error": "Contact not found"})
     return {"status": "ok", "telegram_id": telegram_id}
+
+
+# ── Local web UI static mount (must be last, after all API routes) ─────
+
+if settings.local_ui_enabled:
+    _dist_dir = (
+        Path(settings.local_ui_dist_path)
+        if settings.local_ui_dist_path
+        else Path(__file__).parent / "webui" / "dist"
+    )
+    if _dist_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(_dist_dir), html=True), name="webui")

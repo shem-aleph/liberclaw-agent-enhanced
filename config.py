@@ -30,3 +30,6 @@ class AgentSettings(BaseSettings):
     owner_telegram_id: str = ""  # Auto-allowed in contact list
     pii_redaction_enabled: bool = True  # redact PII from tool outputs
     mcp_servers: str = ""  # JSON: [{"name": "...", "transport": "stdio", "command": "...", "args": [...], "env": {...}}]
+    local_ui_enabled: bool = True
+    local_ui_cors_origins: str = "*"  # comma-separated
+    local_ui_dist_path: str = ""  # empty = <package>/webui/dist
