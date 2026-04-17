@@ -96,14 +96,18 @@ class PersistentShell:
             sentinel = f"__SENTINEL_{uuid.uuid4().hex}__"
 
             # Build the wrapped command:
-            # 1. Run the user's command
+            # 1. Run the user's command inside a `{ …; }` group with stdin
+            #    redirected from /dev/null. Bash scopes the redirection to the
+            #    group, so children (ssh, etc.) inherit a drained fd 0 and
+            #    can't swallow the sentinel bytes queued on bash's own stdin.
             # 2. Capture its exit code
             # 3. Echo a stdout sentinel so we know stdout is done
             # 4. Echo a stderr sentinel with the exit code
             #
             # The stderr sentinel is the authoritative delimiter.
             wrapped = (
-                f"{command}\n"
+                f"{{ {command}\n"
+                f"}} </dev/null\n"
                 f"__exit_code__=$?\n"
                 f"echo '{sentinel}' >&1\n"
                 f"echo '{sentinel}' $__exit_code__ >&2\n"
