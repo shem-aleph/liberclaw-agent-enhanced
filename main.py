@@ -744,7 +744,14 @@ class ChatRequest(BaseModel):
 
 
 async def _emit(run: ChatRun, data: dict):
-    """Append an SSE event to the run buffer and notify waiting readers."""
+    """Append an SSE event to the run buffer and notify waiting readers.
+
+    Injects `timestamp_ms` if the caller didn't set one — frontends use it
+    to render per-message timestamps so all messages don't share the page's
+    render time.
+    """
+    if "timestamp_ms" not in data:
+        data["timestamp_ms"] = int(time.time() * 1000)
     async with run.condition:
         run.events.append(data)
         run.condition.notify_all()
@@ -1065,18 +1072,33 @@ async def chat_stream(chat_id: str):
     return StreamingResponse(_reconnect_stream(), media_type="text/event-stream")
 
 
+def _created_at_to_ms(s: str | None) -> int | None:
+    """Parse the DB's `datetime('now')` text (UTC, 'YYYY-MM-DD HH:MM:SS')
+    into a Unix ms timestamp. Returns None if unparseable."""
+    if not s:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
 @app.get("/chat/{chat_id}/history")
 async def get_chat_history(chat_id: str, limit: int = 50):
     """Return conversation history as ChatMessage events for the frontend."""
-    messages = await db.get_history(chat_id, limit=limit)
+    messages = await db.get_history(chat_id, limit=limit, include_timestamps=True)
     events = []
     for msg in messages:
         role = msg["role"]
+        ts_ms = _created_at_to_ms(msg.get("created_at"))
+        ts_field = {"timestamp_ms": ts_ms} if ts_ms is not None else {}
         if role == "user":
-            events.append({"type": "text", "content": msg.get("content", ""), "name": "user"})
+            events.append({"type": "text", "content": msg.get("content", ""), "name": "user", **ts_field})
         elif role == "assistant":
             if msg.get("content"):
-                events.append({"type": "text", "content": msg["content"]})
+                events.append({"type": "text", "content": msg["content"], **ts_field})
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
@@ -1084,6 +1106,7 @@ async def get_chat_history(chat_id: str, limit: int = 50):
                         "type": "tool_use",
                         "name": fn.get("name", ""),
                         "input": fn.get("arguments", ""),
+                        **ts_field,
                     })
         elif role == "tool":
             # Reconstruct file events from stored tool results
@@ -1091,7 +1114,7 @@ async def get_chat_history(chat_id: str, limit: int = 50):
             if isinstance(content, str) and content.startswith("File sent to user: "):
                 rel_path = content.removeprefix("File sent to user: ").strip()
                 if rel_path:
-                    events.append({"type": "file", "path": rel_path})
+                    events.append({"type": "file", "path": rel_path, **ts_field})
     return {"messages": events}
 
 

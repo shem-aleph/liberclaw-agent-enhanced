@@ -119,9 +119,18 @@ class AgentDatabase:
             )
         await self.db.commit()
 
-    async def get_history(self, chat_id: str, limit: int = 50) -> list[dict]:
+    async def get_history(
+        self, chat_id: str, limit: int = 50, include_timestamps: bool = False
+    ) -> list[dict]:
+        """Return conversation history. When `include_timestamps=True`, each
+        row also carries `created_at` (UTC 'YYYY-MM-DD HH:MM:SS'). Off by
+        default so we never leak DB-only fields into LLM messages (the OpenAI-
+        compatible API rejects unknown keys on some backends)."""
+        cols = "role, content, tool_calls, tool_call_id"
+        if include_timestamps:
+            cols += ", created_at"
         cursor = await self.db.execute(
-            "SELECT role, content, tool_calls, tool_call_id "
+            f"SELECT {cols} "
             "FROM messages WHERE chat_id = ? AND compacted = 0 "
             "ORDER BY created_at DESC LIMIT ?",
             (chat_id, limit),
@@ -144,6 +153,8 @@ class AgentDatabase:
                 msg["tool_calls"] = json.loads(r["tool_calls"])
             if r["tool_call_id"]:
                 msg["tool_call_id"] = r["tool_call_id"]
+            if include_timestamps and r["created_at"]:
+                msg["created_at"] = r["created_at"]
             messages.append(msg)
         return messages
 
