@@ -106,7 +106,7 @@ class CheckpointManager:
         await self.init()
 
         out, err, code = await self._run(
-            "log", f"--pretty=format:%h\t%s\t%ci", f"-n{limit}",
+            "log", "--pretty=format:%h\t%s\t%ci", f"-n{limit}",
             check=False,
         )
         if code != 0 or not out:

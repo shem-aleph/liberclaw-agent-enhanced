@@ -48,7 +48,6 @@ def _markdown_to_telegram_html(text: str) -> str:
     code_blocks: list[str] = []
 
     def _stash_code_block(m: re.Match) -> str:
-        lang = m.group(1) or ""
         code = _html_escape(m.group(2))
         code_blocks.append(f"<pre>{code}</pre>")
         return f"\x00CODEBLOCK{len(code_blocks) - 1}\x00"
