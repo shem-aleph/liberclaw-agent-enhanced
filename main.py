@@ -54,6 +54,25 @@ _telegram_bot: TelegramBot | None = None
 _telegram_bot_task: asyncio.Task | None = None
 
 
+async def _send_file_via_telegram(
+    rel_path: str, caption: str = "", *, chat_id: str = ""
+) -> None:
+    """Best-effort file delivery via the agent's Telegram bot, if configured.
+
+    Args:
+        chat_id: Telegram chat ID to send to. Falls back to owner_telegram_id.
+    """
+    if _telegram_bot is None or not _telegram_bot.connected:
+        return
+    target = chat_id or settings.owner_telegram_id
+    if not target:
+        return
+    try:
+        await _telegram_bot._send_local_file(target, rel_path, caption)
+    except Exception as e:
+        logger.error(f"Telegram file delivery failed for {rel_path}: {e}")
+
+
 # ── Subagent registry ─────────────────────────────────────────────────
 
 MAX_CONCURRENT_SUBAGENTS = 5
@@ -627,13 +646,20 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
             json.dumps({"type": "subagent_completed", "run_id": run.id, "label": run.label, "status": "completed"}),
             source="subagent_event",
         )
-        # Forward file events
+        # Forward file events (pending for web UI + direct Telegram delivery
+        # only when the originating chat is itself Telegram — otherwise we'd
+        # leak web-UI subagent files to the agent owner's Telegram).
+        tg_target = origin_chat_id.removeprefix("tg:") if origin_chat_id.startswith("tg:") else ""
         for fe in files:
             await db.add_pending(
                 origin_chat_id,
                 json.dumps({"type": "file", "path": fe["path"], "caption": fe["caption"]}),
                 source="subagent_file",
             )
+            if tg_target:
+                await _send_file_via_telegram(
+                    fe["path"], fe.get("caption", ""), chat_id=tg_target,
+                )
 
     except asyncio.TimeoutError:
         run.status = "timeout"
@@ -671,6 +697,8 @@ async def _run_cron_job(task: str, job_id: str):
             store_history=True,
             file_events=files,
         )
+        for fe in files:
+            await _send_file_via_telegram(fe["path"], fe.get("caption", ""))
         if result:
             logger.info(f"Cron job {job_id!r} produced output ({len(result)} chars)")
         else:
