@@ -4,6 +4,7 @@ from .skills import (
     SKILL_MANAGE_TOOL_DEF,
     SKILL_VIEW_TOOL_DEF,
     SKILLS_TOOL_DEF,
+    configure_skills,
     _exec_skill_manage,
     _exec_skill_view,
     _exec_skills_list,
