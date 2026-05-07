@@ -42,6 +42,7 @@ from baal_agent.skills import (
     SKILL_MANAGE_TOOL_DEF,
     SKILL_VIEW_TOOL_DEF,
     SKILLS_TOOL_DEF,
+    configure_skills,
     _exec_skill_manage,
     _exec_skill_view,
     _exec_skills_list,
@@ -80,6 +81,7 @@ def configure_tools(workspace_path: str, db=None, inference=None, model: str = "
     if model:
         _model = model
     configure_browser(workspace_path)
+    configure_skills(workspace_path)
 
 
 async def start_shell() -> None:

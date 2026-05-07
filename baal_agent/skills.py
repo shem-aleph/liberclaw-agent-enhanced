@@ -10,7 +10,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tools import _workspace_path
+
+# Workspace path — set via configure_skills() called from tools.configure_tools()
+_workspace_path: str | None = None
+
+
+def configure_skills(workspace_path: str | None) -> None:
+    """Set workspace path for skill operations."""
+    global _workspace_path
+    _workspace_path = workspace_path
 
 SKILLS_TOOL_DEF = {
     "type": "function",
