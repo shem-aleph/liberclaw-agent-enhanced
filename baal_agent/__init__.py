@@ -1,5 +1,13 @@
 from .browser import BROWSER_TOOL_DEF, _exec_browser, configure_browser, shutdown_browser
 from .clarify import CLARIFY_TOOL_DEF, _exec_clarify
+from .skills import (
+    SKILL_MANAGE_TOOL_DEF,
+    SKILL_VIEW_TOOL_DEF,
+    SKILLS_TOOL_DEF,
+    _exec_skill_manage,
+    _exec_skill_view,
+    _exec_skills_list,
+)
 from .compaction import maybe_compact
 from .config import AgentSettings
 from .context import build_system_prompt

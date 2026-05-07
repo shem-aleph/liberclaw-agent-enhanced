@@ -1752,6 +1752,9 @@ TOOL_HANDLERS: dict[str, callable] = {
     "process": _exec_process,
     "browser": _exec_browser,
     "clarify": _exec_clarify,
+    "skills_list": _exec_skills_list,
+    "skill_view": _exec_skill_view,
+    "skill_manage": _exec_skill_manage,
 }
 
 
@@ -1763,6 +1766,9 @@ def get_tool_definitions(*, include_spawn: bool = True, include_browser: bool = 
     if include_browser:
         defs.append(BROWSER_TOOL_DEF)
     defs.append(CLARIFY_TOOL_DEF)
+    defs.append(SKILLS_TOOL_DEF)
+    defs.append(SKILL_VIEW_TOOL_DEF)
+    defs.append(SKILL_MANAGE_TOOL_DEF)
     if _mcp_client is not None:
         defs.extend(_mcp_client.get_tool_definitions())
     return defs
