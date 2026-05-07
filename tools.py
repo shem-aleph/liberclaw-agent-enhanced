@@ -38,6 +38,14 @@ from baal_agent.browser import (
     shutdown_browser as _shutdown_browser_engine,
 )
 from baal_agent.clarify import CLARIFY_TOOL_DEF, _exec_clarify
+from baal_agent.skills import (
+    SKILL_MANAGE_TOOL_DEF,
+    SKILL_VIEW_TOOL_DEF,
+    SKILLS_TOOL_DEF,
+    _exec_skill_manage,
+    _exec_skill_view,
+    _exec_skills_list,
+)
 
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
